@@ -5,6 +5,8 @@ import matplotlib.gridspec as gridspec
 import streamlit as st
 import tempfile
 import os
+import io
+import csv
 
 # ─────────────────────────────────────────────
 #  Page config
@@ -25,25 +27,20 @@ st.markdown("""
 html, body, [class*="css"] {
     font-family: 'DM Sans', sans-serif;
 }
-
 h1, h2, h3 {
     font-family: 'Space Mono', monospace !important;
 }
-
 .stApp {
     background: #0d1117;
     color: #e6edf3;
 }
-
 section[data-testid="stSidebar"] {
     background: #161b22;
     border-right: 1px solid #30363d;
 }
-
 section[data-testid="stSidebar"] * {
     color: #e6edf3 !important;
 }
-
 .stButton > button {
     background: linear-gradient(135deg, #238636, #2ea043);
     color: #ffffff;
@@ -56,13 +53,11 @@ section[data-testid="stSidebar"] * {
     transition: all 0.2s ease;
     letter-spacing: 0.5px;
 }
-
 .stButton > button:hover {
     background: linear-gradient(135deg, #2ea043, #3fb950);
     box-shadow: 0 0 12px rgba(46,160,67,0.4);
     transform: translateY(-1px);
 }
-
 .metric-card {
     background: #161b22;
     border: 1px solid #30363d;
@@ -91,7 +86,6 @@ section[data-testid="stSidebar"] * {
     color: #8b949e;
     margin-top: 2px;
 }
-
 .section-header {
     font-family: 'Space Mono', monospace;
     font-size: 13px;
@@ -102,12 +96,10 @@ section[data-testid="stSidebar"] * {
     padding-bottom: 8px;
     margin-bottom: 16px;
 }
-
 div[data-testid="stProgress"] > div > div {
     background: linear-gradient(90deg, #238636, #58a6ff);
     border-radius: 4px;
 }
-
 .stSlider > div > div > div > div {
     background: #58a6ff !important;
 }
@@ -121,7 +113,7 @@ st.markdown("""
 <div style="padding: 24px 0 8px 0;">
     <h1 style="color:#58a6ff; font-size:28px; margin:0;">🫧 Bubble Column Dynamics</h1>
     <p style="color:#8b949e; font-family:'DM Sans',sans-serif; margin-top:6px; font-size:15px;">
-        Upload a high-speed video and extract bubble velocity & diameter statistics frame by frame.
+        Upload a high-speed video and extract bubble velocity &amp; diameter statistics frame by frame.
     </p>
 </div>
 <hr style="border-color:#30363d; margin-bottom:24px;">
@@ -160,23 +152,30 @@ with st.sidebar:
     max_area = st.number_input("Max Bubble Area (px²)", 1, 200000, 10000, step=100)
 
     st.markdown('<div class="section-header" style="margin-top:24px;">🔗 Matching</div>', unsafe_allow_html=True)
-    max_dist  = st.slider("Max Match Distance (px)", 5, 200, 60)
-    max_dx    = st.slider("Max Horizontal Shift (px)", 1, 100, 25)
-    area_tol  = st.slider("Area Tolerance", 0.1, 1.0, 0.6, 0.05,
-                           help="Fraction of area change allowed between frames.")
-    max_vel   = st.slider("Max Velocity (mm/s)", 50, 2000, 400, 10)
+    max_dist = st.slider("Max Match Distance (px)", 5, 200, 60)
+    max_dx   = st.slider("Max Horizontal Shift (px)", 1, 100, 25)
+    area_tol = st.slider("Area Tolerance", 0.1, 1.0, 0.6, 0.05,
+                          help="Fraction of area change allowed between frames.")
+    max_vel  = st.slider("Max Velocity (mm/s)", 50, 2000, 400, 10)
 
     st.markdown("<br>", unsafe_allow_html=True)
     run_btn = st.button("▶  Run Analysis")
 
 # ─────────────────────────────────────────────
 #  Helper — smooth
+#  reflect-padding avoids zero-pad distortion
+#  at the start/end of the signal.
 # ─────────────────────────────────────────────
 def smooth(x, w=5):
-    return np.convolve(x, np.ones(w) / w, mode="same")
+    x = np.array(x, dtype=np.float64)
+    if len(x) < w:
+        return x
+    pad = w // 2
+    x_padded = np.pad(x, pad, mode="reflect")
+    return np.convolve(x_padded, np.ones(w) / w, mode="valid")[:len(x)]
 
 # ─────────────────────────────────────────────
-#  Main — idle state
+#  Idle state
 # ─────────────────────────────────────────────
 if not video_file:
     st.markdown("""
@@ -190,43 +189,46 @@ if not video_file:
     st.stop()
 
 # ─────────────────────────────────────────────
-#  Main — Run
+#  Run Analysis
 # ─────────────────────────────────────────────
 if run_btn:
-    # Save upload to temp file
+
+    # Save upload to a temp file on disk so OpenCV can open it
     tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     tfile.write(video_file.read())
     tfile.flush()
     tfile.close()
 
-    cap = cv2.VideoCapture(tfile.name)
+    cap          = cv2.VideoCapture(tfile.name)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = original_fps if original_fps > 0 else 30
+    fps          = original_fps if original_fps > 0 else 30
 
-    frame_idx   = 0
-    prev_objects = []
+    # Show a live preview snapshot roughly every 5% of the video
+    DEBUG_EVERY = max(20, total_frames // 20) if total_frames > 0 else 20
 
-    time_axis      = []
-    mean_vel       = []
-    median_vel     = []
-    bubble_counts  = []
-    mean_diams     = []
-    median_diams   = []
+    frame_idx    = 0
+    prev_objects = []   # (cx, cy, area) from the previous frame
 
-    # Progress UI
+    # Per-frame time-series lists
+    time_axis     = []
+    mean_vel      = []
+    median_vel    = []
+    bubble_counts = []
+    mean_diams    = []
+    median_diams  = []
+
+    # All individual matched bubble velocities — used for the histogram
+    # (more informative than just per-frame means)
+    all_bubble_velocities = []
+
+    # ── UI elements ──
     progress_bar = st.progress(0)
     status_txt   = st.empty()
 
-    preview_col1, preview_col2, preview_col3 = st.columns(3)
-    preview_slots = [
-        preview_col1.empty(),
-        preview_col2.empty(),
-        preview_col3.empty(),
-    ]
-    preview_labels = ["Original", "Gray (norm)", "Detections"]
+    prev_col1, prev_col2, prev_col3 = st.columns(3)
+    preview_slots = [prev_col1.empty(), prev_col2.empty(), prev_col3.empty()]
 
-    DEBUG_EVERY = max(1, total_frames // 5) if total_frames > 0 else 20
-
+    # ── Processing loop ──
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -234,25 +236,33 @@ if run_btn:
 
         h, w = frame.shape[:2]
 
-        # ── Crop ──
-        x1 = int(crop_left   * w)
+        # Crop
+        x1 = int(crop_left         * w)
         x2 = int((1 - crop_right)  * w)
-        y1 = int(crop_top    * h)
+        y1 = int(crop_top          * h)
         y2 = int((1 - crop_bottom) * h)
+
+        # Skip frame if crop ratios are inverted / overlapping
+        if x2 <= x1 or y2 <= y1:
+            frame_idx += 1
+            continue
+
         frame = frame[y1:y2, x1:x2]
 
-        # ── Preprocess ──
-        gray       = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray_f     = gray.astype(np.float32)
-        mx         = np.max(gray_f)
-        gray_norm  = (gray_f / mx * 255).astype(np.uint8) if mx > 0 else gray
-        blurred    = cv2.GaussianBlur(gray_norm, (5, 5), 0)
-        edges      = cv2.Canny(blurred, 20, 80)
-        kernel     = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        edges      = cv2.dilate(edges, kernel, iterations=1)
+        # Preprocess
+        gray      = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray_f    = gray.astype(np.float32)
+        mx        = np.max(gray_f)
+        gray_norm = (gray_f / mx * 255).astype(np.uint8) if mx > 0 else gray.copy()
+        blurred   = cv2.GaussianBlur(gray_norm, (5, 5), 0)
+        edges     = cv2.Canny(blurred, 20, 80)
+        kernel    = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        edges     = cv2.dilate(edges, kernel, iterations=1)
 
-        # ── Contours ──
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Contour detection
+        contours, _ = cv2.findContours(
+            edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
 
         curr_objects = []
         diameters    = []
@@ -268,13 +278,14 @@ if run_btn:
                 cy = int(M["m01"] / M["m00"])
                 curr_objects.append((cx, cy, area))
 
-                diam = np.sqrt(4 * area / np.pi) * mm_per_pixel
+                # Equivalent circular diameter (px → mm)
+                diam = np.sqrt(4.0 * area / np.pi) * mm_per_pixel
                 diameters.append(diam)
 
                 xb, yb, wb, hb = cv2.boundingRect(c)
                 cv2.rectangle(vis, (xb, yb), (xb + wb, yb + hb), (0, 255, 0), 1)
 
-        # ── Velocity matching ──
+        # Frame-to-frame matching
         velocities   = []
         used_indices = set()
 
@@ -286,7 +297,7 @@ if run_btn:
                 if idx in used_indices:
                     continue
                 dx   = x_curr - x_prev
-                dy   = y_prev - y_curr
+                dy   = y_prev - y_curr   # positive = upward
                 if dy <= 0:
                     continue
                 dist = np.sqrt(dx**2 + dy**2)
@@ -306,67 +317,74 @@ if run_btn:
                 v_mm = (y_prev - y_curr) * fps * mm_per_pixel
                 if 0 < v_mm < max_vel:
                     velocities.append(v_mm)
+                    all_bubble_velocities.append(v_mm)  # accumulate for histogram
 
-        # ── Store ──
-        mean_vel.append(np.mean(velocities)  if velocities else 0)
-        median_vel.append(np.median(velocities) if velocities else 0)
-        mean_diams.append(np.mean(diameters)   if diameters  else 0)
-        median_diams.append(np.median(diameters) if diameters  else 0)
+        # Store per-frame stats
+        mean_vel.append(np.mean(velocities)      if velocities else 0.0)
+        median_vel.append(np.median(velocities)  if velocities else 0.0)
+        mean_diams.append(np.mean(diameters)     if diameters  else 0.0)
+        median_diams.append(np.median(diameters) if diameters  else 0.0)
         bubble_counts.append(len(curr_objects))
         time_axis.append(frame_idx / fps)
 
         prev_objects = curr_objects
         frame_idx   += 1
 
-        # ── Progress ──
+        # Progress
         pct = frame_idx / total_frames if total_frames > 0 else 0
         progress_bar.progress(min(pct, 1.0))
         status_txt.markdown(
             f"<span style='color:#8b949e; font-family:Space Mono,monospace; font-size:12px;'>"
-            f"Frame {frame_idx} / {total_frames} — {len(curr_objects)} bubbles detected</span>",
+            f"Frame {frame_idx} / {total_frames} &nbsp;—&nbsp; "
+            f"{len(curr_objects)} bubbles detected &nbsp;|&nbsp; "
+            f"{len(velocities)} velocity matches</span>",
             unsafe_allow_html=True,
         )
 
-        # ── Preview snapshots ──
+        # Live preview
         if frame_idx % DEBUG_EVERY == 0:
             preview_slots[0].image(
                 cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
                 caption="Original", use_container_width=True
             )
             preview_slots[1].image(
-                gray_norm, caption="Gray (normalised)", clamp=True,
-                use_container_width=True
+                gray_norm, caption="Gray (normalised)",
+                clamp=True, use_container_width=True
             )
             preview_slots[2].image(
                 cv2.cvtColor(vis, cv2.COLOR_BGR2RGB),
-                caption=f"Detections ({len(curr_objects)})", use_container_width=True
+                caption=f"Detections ({len(curr_objects)})",
+                use_container_width=True
             )
 
     cap.release()
     os.unlink(tfile.name)
+
     progress_bar.progress(1.0)
     status_txt.markdown(
-        "<span style='color:#3fb950; font-family:Space Mono,monospace; font-size:12px;'>✔ Analysis complete</span>",
+        "<span style='color:#3fb950; font-family:Space Mono,monospace; font-size:12px;'>"
+        "✔ Analysis complete</span>",
         unsafe_allow_html=True,
     )
 
     # ─────────────────────────────────────────────
-    #  Summary metrics
+    #  Summary metric cards
     # ─────────────────────────────────────────────
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown('<div class="section-header">📊 Summary</div>', unsafe_allow_html=True)
 
-    m1, m2, m3, m4 = st.columns(4)
-    avg_count   = np.mean(bubble_counts)
-    avg_vel     = np.mean([v for v in mean_vel   if v > 0]) if any(v > 0 for v in mean_vel)   else 0
-    avg_diam    = np.mean([d for d in mean_diams  if d > 0]) if any(d > 0 for d in mean_diams) else 0
-    total_f     = frame_idx
+    avg_count = float(np.mean(bubble_counts)) if bubble_counts else 0.0
+    avg_vel   = float(np.mean([v for v in mean_vel   if v > 0])) \
+                if any(v > 0 for v in mean_vel)   else 0.0
+    avg_diam  = float(np.mean([d for d in mean_diams if d > 0])) \
+                if any(d > 0 for d in mean_diams) else 0.0
 
+    m1, m2, m3, m4 = st.columns(4)
     for col, label, value, unit in zip(
         [m1, m2, m3, m4],
-        ["Frames Processed", "Avg Bubble Count", "Avg Velocity", "Avg Diameter"],
-        [total_f, f"{avg_count:.1f}", f"{avg_vel:.1f}", f"{avg_diam:.2f}"],
-        ["frames", "bubbles/frame", "mm/s", "mm"],
+        ["Frames Processed", "Avg Bubble Count", "Avg Velocity",  "Avg Diameter"],
+        [frame_idx,          f"{avg_count:.1f}", f"{avg_vel:.1f}", f"{avg_diam:.2f}"],
+        ["frames",           "bubbles / frame",  "mm/s",           "mm"],
     ):
         col.markdown(f"""
         <div class="metric-card">
@@ -393,63 +411,83 @@ if run_btn:
     BLUE     = "#58a6ff"
     GREEN    = "#3fb950"
     ORANGE   = "#d29922"
-    RED      = "#f85149"
 
-    fig = plt.figure(figsize=(14, 10), facecolor=DARK_BG)
-    gs  = gridspec.GridSpec(2, 2, figure=fig, hspace=0.45, wspace=0.35)
-
-    axes_cfg = [
-        (gs[0, 0], "Bubble Velocity — Mean & Median",  "Velocity (mm/s)",
-         [(time_axis, mean_vel_s,   BLUE,   "Mean"),
-          (time_axis, median_vel_s, GREEN,  "Median")]),
-        (gs[0, 1], "Bubble Count per Frame",           "Count",
-         [(time_axis, bubble_counts, ORANGE, "Count")]),
-        (gs[1, 0], "Bubble Diameter — Mean & Median",  "Diameter (mm)",
-         [(time_axis, mean_d_s,    BLUE,  "Mean"),
-          (time_axis, median_d_s,  GREEN, "Median")]),
-        (gs[1, 1], "Velocity Distribution (last frame)", "Frequency",
-         None),
-    ]
-
-    for i, (gspec, title, ylabel, lines) in enumerate(axes_cfg):
-        ax = fig.add_subplot(gspec)
+    def style_ax(ax, title, xlabel, ylabel):
         ax.set_facecolor("#161b22")
         ax.tick_params(colors=TEXT_COL, labelsize=9)
         for spine in ax.spines.values():
             spine.set_edgecolor(GRID_COL)
         ax.grid(True, color=GRID_COL, linewidth=0.6)
-        ax.set_title(title, color="#e6edf3", fontsize=11, pad=10)
-        ax.set_xlabel("Time (s)", color=TEXT_COL, fontsize=9)
-        ax.set_ylabel(ylabel,     color=TEXT_COL, fontsize=9)
+        ax.set_title(title,   color="#e6edf3", fontsize=11, pad=10)
+        ax.set_xlabel(xlabel, color=TEXT_COL,  fontsize=9)
+        ax.set_ylabel(ylabel, color=TEXT_COL,  fontsize=9)
 
-        if lines:
-            for (x, y, color, label) in lines:
-                ax.plot(x, y, color=color, linewidth=1.5, label=label, alpha=0.9)
-            ax.legend(fontsize=8, facecolor="#21262d", labelcolor="#e6edf3",
-                      edgecolor=GRID_COL)
-        else:
-            # histogram of non-zero velocities across all frames
-            all_v = [v for v in mean_vel if v > 0]
-            if all_v:
-                ax.hist(all_v, bins=30, color=BLUE, alpha=0.8, edgecolor=DARK_BG)
-            else:
-                ax.text(0.5, 0.5, "No data", transform=ax.transAxes,
-                        ha="center", va="center", color=TEXT_COL)
+    fig = plt.figure(figsize=(14, 10), facecolor=DARK_BG)
+    gs  = gridspec.GridSpec(2, 2, figure=fig, hspace=0.45, wspace=0.35)
+
+    # Plot 1 — Velocity vs Time
+    ax1 = fig.add_subplot(gs[0, 0])
+    style_ax(ax1, "Bubble Velocity — Mean & Median", "Time (s)", "Velocity (mm/s)")
+    ax1.plot(time_axis, mean_vel_s,   color=BLUE,  linewidth=1.5, label="Mean",   alpha=0.9)
+    ax1.plot(time_axis, median_vel_s, color=GREEN, linewidth=1.5, label="Median", alpha=0.9)
+    ax1.legend(fontsize=8, facecolor="#21262d", labelcolor="#e6edf3", edgecolor=GRID_COL)
+
+    # Plot 2 — Bubble Count vs Time
+    ax2 = fig.add_subplot(gs[0, 1])
+    style_ax(ax2, "Bubble Count per Frame", "Time (s)", "Count")
+    ax2.plot(time_axis, bubble_counts, color=ORANGE, linewidth=1.2, alpha=0.9)
+
+    # Plot 3 — Diameter vs Time
+    ax3 = fig.add_subplot(gs[1, 0])
+    style_ax(ax3, "Bubble Diameter — Mean & Median", "Time (s)", "Diameter (mm)")
+    ax3.plot(time_axis, mean_d_s,   color=BLUE,  linewidth=1.5, label="Mean",   alpha=0.9)
+    ax3.plot(time_axis, median_d_s, color=GREEN, linewidth=1.5, label="Median", alpha=0.9)
+    ax3.legend(fontsize=8, facecolor="#21262d", labelcolor="#e6edf3", edgecolor=GRID_COL)
+
+    # Plot 4 — Velocity Distribution Histogram (ALL matched bubbles, ALL frames)
+    # FIXED: title, x-axis label, and data source all corrected
+    ax4 = fig.add_subplot(gs[1, 1])
+    style_ax(ax4,
+             "Velocity Distribution — All Frames",
+             "Velocity (mm/s)",           # was "Time (s)" — now correct
+             "Frequency (bubble count)")  # clarified y-label
+    if all_bubble_velocities:
+        ax4.hist(
+            all_bubble_velocities,
+            bins=40,
+            color=BLUE,
+            alpha=0.8,
+            edgecolor=DARK_BG,
+            linewidth=0.4,
+        )
+        v_mean   = np.mean(all_bubble_velocities)
+        v_median = np.median(all_bubble_velocities)
+        ax4.axvline(v_mean,   color=GREEN,  linewidth=1.5, linestyle="--",
+                    label=f"Mean   {v_mean:.1f} mm/s")
+        ax4.axvline(v_median, color=ORANGE, linewidth=1.5, linestyle=":",
+                    label=f"Median {v_median:.1f} mm/s")
+        ax4.legend(fontsize=8, facecolor="#21262d",
+                   labelcolor="#e6edf3", edgecolor=GRID_COL)
+    else:
+        ax4.text(0.5, 0.5, "No matched bubbles",
+                 transform=ax4.transAxes, ha="center", va="center",
+                 color=TEXT_COL, fontsize=10)
 
     st.pyplot(fig)
     plt.close(fig)
 
     # ─────────────────────────────────────────────
-    #  CSV Download
+    #  CSV Export
     # ─────────────────────────────────────────────
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown('<div class="section-header">💾 Export</div>', unsafe_allow_html=True)
 
-    import io, csv
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["time_s", "mean_vel_mms", "median_vel_mms",
-                     "bubble_count", "mean_diam_mm", "median_diam_mm"])
+    writer.writerow([
+        "time_s", "mean_vel_mms", "median_vel_mms",
+        "bubble_count", "mean_diam_mm", "median_diam_mm"
+    ])
     for row in zip(time_axis, mean_vel, median_vel,
                    bubble_counts, mean_diams, median_diams):
         writer.writerow([f"{v:.4f}" for v in row])
